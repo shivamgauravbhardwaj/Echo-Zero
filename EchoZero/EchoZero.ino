@@ -39,6 +39,19 @@ const int micPin       = 34;
 
 int micCenter = 1482; // Auto-calibrated in setup()
 
+// --- Human Voice Band-Pass Filter State (300Hz - 3400Hz @ 8kHz) ---
+float prevRawCentered = 0.0f;
+float prevHpOut       = 0.0f;
+float prevLpOut       = 0.0f;
+const float ALPHA_HP = 0.8093f;
+const float ALPHA_LP = 0.7276f;
+const float VOICE_GATE_THRESHOLD = 45.0f;
+
+// --- Acoustic Loop & Echo Suppressor ---
+volatile unsigned long lastRxAudioTime = 0;
+const unsigned long ECHO_HOLD_MS = 180;     // Suppresses room echo tail after speaker stops
+const float LOOP_DUCK_MULTIPLIER = 4.5f;    // Raises mic gate 4.5x while speaker is active
+
 // --- Protocol & GPS Variables ---
 bool useEspNow = false;
 double currentLat = 0.0; 
@@ -118,6 +131,7 @@ MorseTable morseTable[] = {
 void setupI2S();
 void playI2STone(int freq, int durationMs);
 void playI2SVoicePacket(const uint8_t* samples, int len);
+float filterHumanVoice(float rawCentered);
 void playBootSequence();
 void parseGPS();
 float calculateDistance(double lat1, double lon1, double lat2, double lon2);
@@ -129,40 +143,53 @@ char decodeMorse(String code);
 void updateDisplay();
 void showFeedbackOLED(String msg);
 
+// --- 300Hz - 3400Hz Band-Pass Filter for Human Speech ---
+float filterHumanVoice(float rawCentered) {
+    float hpOut = ALPHA_HP * (prevHpOut + rawCentered - prevRawCentered);
+    prevRawCentered = rawCentered;
+    prevHpOut = hpOut;
+
+    float lpOut = prevLpOut + ALPHA_LP * (hpOut - prevLpOut);
+    prevLpOut = lpOut;
+
+    return lpOut;
+}
+
 // --- Core v3.x Stereo I2S Audio Functions ---
 void setupI2S() {
     i2s.setPins(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DIN_PIN);
-    // Stereo mode duplicates samples to both L and R slots for MAX98357A
     if (!i2s.begin(I2S_MODE_STD, 8000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) {
         Serial.println("I2S Init Failed!");
     }
 }
 
 void playI2STone(int freq, int durationMs) {
+    lastRxAudioTime = millis(); // Prevent local tone from triggering mic loop
     const int sampleRate = 8000;
     int totalSamples = (sampleRate * durationMs) / 1000;
-    int16_t stereoBuf[128]; // 64 stereo frames (Left + Right)
+    int16_t stereoBuf[128];
     
     for (int i = 0; i < totalSamples; i += 64) {
         int chunk = min(64, totalSamples - i);
         for (int j = 0; j < chunk; j++) {
             float t = (float)(i + j) / sampleRate;
             int16_t val = (int16_t)(sin(2.0 * PI * freq * t) * 8000);
-            stereoBuf[j * 2]     = val; // Left slot
-            stereoBuf[j * 2 + 1] = val; // Right slot
+            stereoBuf[j * 2]     = val;
+            stereoBuf[j * 2 + 1] = val;
         }
         i2s.write((uint8_t *)stereoBuf, chunk * 2 * sizeof(int16_t));
     }
+    lastRxAudioTime = millis();
 }
 
 void playI2SVoicePacket(const uint8_t* samples, int len) {
-    int16_t stereoBuf[128]; // 64 stereo frames (Left + Right)
+    lastRxAudioTime = millis(); // Engage loop filter while speaker plays RX voice
+    int16_t stereoBuf[128];
     int count = min(len, 64);
     for (int i = 0; i < count; i++) {
-        // Convert 8-bit unsigned (0..255, center 128) to 16-bit signed PCM
         int16_t val = ((int16_t)samples[i] - 128) << 8;
-        stereoBuf[i * 2]     = val; // Left slot
-        stereoBuf[i * 2 + 1] = val; // Right slot
+        stereoBuf[i * 2]     = val;
+        stereoBuf[i * 2 + 1] = val;
     }
     i2s.write((uint8_t *)stereoBuf, count * 2 * sizeof(int16_t));
 }
@@ -218,7 +245,6 @@ void playBootSequence() {
     }
   }
   
-  // Boot Chime over Stereo I2S
   playI2STone(523, 80);
   playI2STone(784, 120);
 
@@ -392,29 +418,39 @@ void loop() {
         }
     }
 
-    // 3. Precision Audio Transmission (8kHz centered around calibrated micCenter)
+    // 3. Human Voice Band-Pass + Acoustic Loop Suppressor (300Hz - 3400Hz @ 8kHz)
     if (useEspNow) {
         outgoingData.type = 'A';
-        bool hasAudioActivity = false;
+        float packetEnergySum = 0.0f;
+
+        // Check if local speaker played recently (within ECHO_HOLD_MS)
+        bool isSpeakerActive = (millis() - lastRxAudioTime) < ECHO_HOLD_MS;
+        float activeGateThreshold = isSpeakerActive 
+                                    ? (VOICE_GATE_THRESHOLD * LOOP_DUCK_MULTIPLIER) 
+                                    : VOICE_GATE_THRESHOLD;
+        float sampleFloorGate     = isSpeakerActive ? 95.0f : 25.0f;
         
         for (int i = 0; i < 64; i++) {
             unsigned long startMicros = micros();
-            int rawMic = analogRead(micPin);
-            int centered = rawMic - micCenter;
+            float rawCentered = (float)(analogRead(micPin) - micCenter);
             
-            // Noise gate: +/- 50 ADC counts around idle center
-            if (abs(centered) < 50) {
+            // Apply 300Hz - 3400Hz band-pass filter
+            float voiceSample = filterHumanVoice(rawCentered);
+            packetEnergySum += fabsf(voiceSample);
+            
+            if (fabsf(voiceSample) < sampleFloorGate) {
                 outgoingData.payload[i] = 128; // Dead silence
             } else {
-                hasAudioActivity = true;
-                int clamped = constrain(centered, -900, 900);
-                outgoingData.payload[i] = map(clamped, -900, 900, 0, 255);
+                int clamped = constrain((int)voiceSample, -850, 850);
+                outgoingData.payload[i] = map(clamped, -850, 850, 0, 255);
             }
             
             while (micros() - startMicros < 125); // 8000Hz lock
         }
         
-        if (hasAudioActivity) {
+        // Transmit only if voice energy clears the loop-adjusted gate
+        float avgVoiceEnergy = packetEnergySum / 64.0f;
+        if (avgVoiceEnergy > activeGateThreshold) {
             esp_now_send(peerAddress, (uint8_t *)&outgoingData, sizeof(outgoingData));
         }
     }
@@ -572,7 +608,7 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incoming, int le
     if (incomingData.magic[0] != 'E' || incomingData.magic[1] != 'Z') return; 
     
     if (incomingData.type == 'A') {
-        // Push packet into ring buffer so loop() writes to I2S safely
+        lastRxAudioTime = millis(); // Mark RX active immediately upon packet arrival
         uint8_t nextHead = (vqHead + 1) % VOICE_QUEUE_SLOTS;
         if (nextHead != vqTail) {
             memcpy(voiceQueue[vqHead], incomingData.payload, 64);
